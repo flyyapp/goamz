@@ -312,6 +312,45 @@ func GetRegion(regionName string) (region Region) {
 	return
 }
 
+// GetEcsCredentials creates an Auth based on the container's task role credentials.
+func GetEcsCredentials(uri string) (cred credentials, err error) {
+	const host = `169.254.170.2`
+	url := fmt.Sprintf("http://%s%s", host, uri)
+
+	c := http.Client{
+		Transport: &http.Transport{
+			Dial: func(netw, addr string) (net.Conn, error) {
+				deadline := time.Now().Add(5 * time.Second)
+				c, err := net.DialTimeout(netw, addr, time.Second*2)
+				if err != nil {
+					return nil, err
+				}
+				c.SetDeadline(deadline)
+				return c, nil
+			},
+		},
+	}
+
+	resp, err := c.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		err = fmt.Errorf("Code %d returned for url %s", resp.StatusCode, url)
+		return
+	}
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	err = json.Unmarshal([]byte(body), &cred)
+	return
+}
+
 // GetInstanceCredentials creates an Auth based on the instance's role credentials.
 // If the running instance is not in EC2 or does not have a valid IAM role, an error will be returned.
 // For more info about setting up IAM roles, see http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html
@@ -347,6 +386,23 @@ func GetAuth(accessKey string, secretKey, token string, expiration time.Time) (a
 	if err == nil {
 		// Found auth, return
 		return
+	}
+
+	// Next try getting auth from ecs task role
+	ecsCredURI := os.Getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+	if len(ecsCredURI) > 0 {
+		cred, err := GetEcsCredentials(ecsCredURI)
+		if err == nil {
+			auth.AccessKey = cred.AccessKeyId
+			auth.SecretKey = cred.SecretAccessKey
+			auth.token = cred.Token
+			exptdate, err := time.Parse("2006-01-02T15:04:05Z", cred.Expiration)
+			if err != nil {
+				err = fmt.Errorf("Error Parsing expiration date: cred.Expiration :%s , error: %s \n", cred.Expiration, err)
+			}
+			auth.expiration = exptdate
+			return auth, err
+		}
 	}
 
 	// Next try getting auth from the instance role
